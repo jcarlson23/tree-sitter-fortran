@@ -1,4 +1,8 @@
+Cargo.lock
 node_modules
 target
 build
+dist
+target
+*.egg-info
 *.log

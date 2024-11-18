@@ -82,10 +82,11 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-fortran"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "cc",
  "tree-sitter",
+ "tree-sitter-language",
 ]
 
 [[package]]

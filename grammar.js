@@ -48,6 +48,23 @@ const PREC = {
   TYPE_MEMBER: 100
 }
 
+const PREPROC_PREC = {
+  DEFAULT: 0,
+  LOGICAL_OR: 1,
+  LOGICAL_AND: 2,
+  INCLUSIVE_OR: 3,
+  EXCLUSIVE_OR: 4,
+  BITWISE_AND: 5,
+  EQUAL: 6,
+  RELATIONAL: 7,
+  OFFSETOF: 8,
+  SHIFT: 9,
+  ADD: 10,
+  MULTIPLY: 11,
+  UNARY: 14,
+  CALL: 15,
+};
+
 module.exports = grammar({
   name: 'fortran',
 
@@ -56,15 +73,16 @@ module.exports = grammar({
     $._integer_literal,
     $._float_literal,
     $._boz_literal,
-    $.string_literal,
-    $._end_of_statement
+    $._string_literal,
+    $._string_literal_kind,
+    $._end_of_statement,
+    $._preproc_unary_operator,
   ],
 
   extras: $ => [
     /[ \t\r\n]/,
     $.comment,
     '&',
-    $.preproc_file_line
   ],
 
   inline: $ => [
@@ -74,7 +92,7 @@ module.exports = grammar({
 
   conflicts: $ => [
     [$._expression, $.complex_literal],
-    [$.argument_list, $.parenthesized_expression],
+    [$._argument_list, $.parenthesized_expression],
     [$.case_statement],
     [$.data_set, $._expression],
     [$.data_value, $._expression],
@@ -82,14 +100,17 @@ module.exports = grammar({
     [$.elseif_clause, $.identifier],
     [$.elseif_clause],
     [$.elsewhere_clause],
-    [$.interface_statement],
-    [$.intrinsic_type, $.identifier],
+    [$.intrinsic_type],
+    [$._intrinsic_type, $.identifier],
     [$.module_statement, $.procedure_qualifier],
     [$.procedure_declaration],
     [$.rank_statement],
     [$.stop_statement, $.identifier],
-    [$.type_qualifier, $.identifier],
     [$.type_statement],
+    [$.preproc_ifdef_in_specification_part, $.program],
+    [$.preproc_else_in_specification_part, $.program],
+    [$.statement_function, $._expression],
+    [$.coarray_critical_statement, $.identifier],
   ],
 
   rules: {
@@ -105,14 +126,166 @@ module.exports = grammar({
       $.submodule,
       $.interface,
       $.subroutine,
-      $.function
+      $.function,
+      $.preproc_if,
+      $.preproc_ifdef,
+      $.preproc_include,
+      $.preproc_def,
+      $.preproc_function_def,
+      $.preproc_call,
+    )),
+
+    // Preprocessor
+
+    preproc_include: $ => seq(
+      preprocessor('include'),
+      field('path', choice(
+        $.string_literal,
+        $.identifier,
+        $.system_lib_string,
+        alias($.preproc_call_expression, $.call_expression),
+      )),
+      /\r?\n/,
+    ),
+
+    preproc_def: $ => seq(
+      preprocessor('define'),
+      field('name', $.identifier),
+      field('value', optional($.preproc_arg)),
+      token.immediate(/\r?\n/),
+    ),
+
+    preproc_function_def: $ => seq(
+      preprocessor('define'),
+      field('name', $.identifier),
+      field('parameters', $.preproc_params),
+      field('value', optional($.preproc_arg)),
+      token.immediate(/\r?\n/),
+    ),
+
+    preproc_params: $ => seq(
+      token.immediate('('), commaSep(choice($.identifier, '...')), ')',
+    ),
+
+    preproc_call: $ => seq(
+      field('directive', $.preproc_directive),
+      field('argument', optional($.preproc_arg)),
+      token.immediate(/\r?\n/),
+    ),
+
+    ...preprocIf('', $ => repeat($._top_level_item)),
+    ...preprocIf('_in_module', $ => seq(
+      repeat($._specification_part),
+      optional($.internal_procedures)
+    )),
+    ...preprocIf('_in_specification_part', $ => seq(
+      repeat($._specification_part),
+      repeat($._statement),
+      optional($.internal_procedures)
+    ), 3),
+    ...preprocIf('_in_statements', $ => seq(
+      repeat($._statement),
+      optional($.internal_procedures)
+    ), 2),
+    ...preprocIf('_in_internal_procedures', $ => repeat($._internal_procedures)),
+    ...preprocIf('_in_derived_type', $ => repeat($.variable_declaration)),
+
+    // This doesn't capture multiline arguments, probably because our
+    // scanner isn't aware of preprocessor statements yet
+    preproc_arg: _ => token(prec(-1, /\S([^/\n]|\/[^*]|\\\r?\n)*/)),
+    preproc_directive: _ => /#[ \t]*[a-zA-Z0-9]\w*/,
+
+    _preproc_expression: $ => choice(
+      $.identifier,
+      alias($.preproc_call_expression, $.call_expression),
+      $.number_literal,
+      $.string_literal,
+      $.preproc_defined,
+      alias($.preproc_unary_expression, $.unary_expression),
+      alias($.preproc_binary_expression, $.binary_expression),
+      alias($.preproc_parenthesized_expression, $.parenthesized_expression),
+    ),
+
+    preproc_parenthesized_expression: $ => seq(
+      '(',
+      $._preproc_expression,
+      ')',
+    ),
+
+    preproc_defined: $ => choice(
+      prec(PREPROC_PREC.CALL, seq('defined', '(', $.identifier, ')')),
+      seq('defined', $.identifier),
+    ),
+
+    // Preprocessor unary operator uses an external scanner to catch
+    // '!' before its parsed as a comment
+    preproc_unary_expression: $ => prec.left(PREPROC_PREC.UNARY, seq(
+      field('operator', $._preproc_unary_operator),
+      field('argument', $._preproc_expression),
+    )),
+
+    preproc_call_expression: $ => prec(PREPROC_PREC.CALL, seq(
+      field('function', $.identifier),
+      field('arguments', alias($.preproc_argument_list, $.argument_list)),
+    )),
+
+    preproc_argument_list: $ => seq(
+      '(',
+      commaSep($._preproc_expression),
+      ')',
+    ),
+
+    preproc_comment: $ => /\/\*.*\*\//,
+
+    preproc_binary_expression: $ => {
+      const table = [
+        ['+', PREPROC_PREC.ADD],
+        ['-', PREPROC_PREC.ADD],
+        ['*', PREPROC_PREC.MULTIPLY],
+        ['/', PREPROC_PREC.MULTIPLY],
+        ['%', PREPROC_PREC.MULTIPLY],
+        ['||', PREPROC_PREC.LOGICAL_OR],
+        ['&&', PREPROC_PREC.LOGICAL_AND],
+        ['|', PREPROC_PREC.INCLUSIVE_OR],
+        ['^', PREPROC_PREC.EXCLUSIVE_OR],
+        ['&', PREPROC_PREC.BITWISE_AND],
+        ['==', PREPROC_PREC.EQUAL],
+        ['!=', PREPROC_PREC.EQUAL],
+        ['>', PREPROC_PREC.RELATIONAL],
+        ['>=', PREPROC_PREC.RELATIONAL],
+        ['<=', PREPROC_PREC.RELATIONAL],
+        ['<', PREPROC_PREC.RELATIONAL],
+        ['<<', PREPROC_PREC.SHIFT],
+        ['>>', PREPROC_PREC.SHIFT],
+      ];
+
+      return choice(...table.map(([operator, precedence]) => {
+        return prec.left(precedence, seq(
+          field('left', $._preproc_expression),
+          // @ts-ignore
+          field('operator', operator),
+          field('right', $._preproc_expression),
+        ));
+      }));
+    },
+
+    system_lib_string: _ => token(seq(
+      '<',
+      repeat(choice(/[^>\n]/, '\\>')),
+      '>',
     )),
 
     // Block level structures
 
     program: $ => seq(
       optional($.program_statement),
-      repeat($._specification_part),
+      repeat(
+        choice(
+          $._specification_part,
+          alias($.preproc_if_in_specification_part, $.preproc_if),
+          alias($.preproc_ifdef_in_specification_part, $.preproc_ifdef)
+        ),
+      ),
       repeat($._statement),
       optional($.internal_procedures),
       $.end_program_statement
@@ -123,7 +296,13 @@ module.exports = grammar({
 
     module: $ => seq(
       $.module_statement,
-      repeat($._specification_part),
+      repeat(
+        choice(
+          $._specification_part,
+          alias($.preproc_if_in_module, $.preproc_if),
+          alias($.preproc_ifdef_in_module, $.preproc_ifdef)
+        ),
+      ),
       optional($.internal_procedures),
       $.end_module_statement
     ),
@@ -131,10 +310,15 @@ module.exports = grammar({
     module_statement: $ => seq(caseInsensitive('module'), $._name),
     end_module_statement: $ => blockStructureEnding($, 'module'),
 
-
     submodule: $ => seq(
       $.submodule_statement,
-      repeat($._specification_part),
+      repeat(
+        choice(
+          $._specification_part,
+          alias($.preproc_if_in_module, $.preproc_if),
+          alias($.preproc_ifdef_in_module, $.preproc_ifdef)
+        ),
+      ),
       optional($.internal_procedures),
       $.end_submodule_statement
     ),
@@ -167,6 +351,7 @@ module.exports = grammar({
       optional($.abstract_specifier),
       caseInsensitive('interface'),
       optional(choice($._name, $._generic_procedure)),
+      $._end_of_statement,
     ),
 
     end_interface_statement: $ => prec.right(seq(
@@ -189,14 +374,7 @@ module.exports = grammar({
         $.defined_io_procedure,
     ),
 
-    subroutine: $ => seq(
-      $.subroutine_statement,
-      $._end_of_statement,
-      repeat($._specification_part),
-      repeat($._statement),
-      optional($.internal_procedures),
-      $.end_subroutine_statement
-    ),
+    subroutine: $ => procedure($, $.subroutine_statement, $.end_subroutine_statement),
 
     subroutine_statement: $ => seq(
       optional($._callable_interface_qualifers),
@@ -208,14 +386,7 @@ module.exports = grammar({
 
     end_subroutine_statement: $ => blockStructureEnding($, 'subroutine'),
 
-    module_procedure: $ => seq(
-      $.module_procedure_statement,
-      $._end_of_statement,
-      repeat($._specification_part),
-      repeat($._statement),
-      optional($.internal_procedures),
-      $.end_module_procedure_statement
-    ),
+    module_procedure: $ => procedure($, $.module_procedure_statement, $.end_module_procedure_statement),
 
     module_procedure_statement: $ => seq(
       optional($._callable_interface_qualifers),
@@ -225,14 +396,7 @@ module.exports = grammar({
 
     end_module_procedure_statement: $ => blockStructureEnding($, 'procedure'),
 
-    function: $ => seq(
-      $.function_statement,
-      $._end_of_statement,
-      repeat($._specification_part),
-      repeat($._statement),
-      optional($.internal_procedures),
-      $.end_function_statement
-    ),
+    function: $ => procedure($, $.function_statement, $.end_function_statement),
 
     function_statement: $ => seq(
       optional($._callable_interface_qualifers),
@@ -257,8 +421,8 @@ module.exports = grammar({
       prec.right(1, choice(
         $.procedure_attributes,
         $.procedure_qualifier,
-        $._intrinsic_type,
-        $.derived_type
+        field('type', $.intrinsic_type),
+        field('type', $.derived_type)
       ))),
 
     procedure_attributes: $ => prec(1, seq(
@@ -297,14 +461,23 @@ module.exports = grammar({
     internal_procedures: $ => seq(
       $.contains_statement,
       $._end_of_statement,
-      repeat(choice(
-        $.function,
-        $.module_procedure,
-        $.subroutine,
-      ))
+      repeat($._internal_procedures)
     ),
 
     contains_statement: $ => caseInsensitive('contains'),
+
+    _internal_procedures: $ => choice(
+      $.function,
+      $.module_procedure,
+      $.subroutine,
+      $.include_statement,
+      alias($.preproc_if_in_internal_procedures, $.preproc_if),
+      alias($.preproc_ifdef_in_internal_procedures, $.preproc_ifdef),
+      $.preproc_include,
+      $.preproc_def,
+      $.preproc_function_def,
+      $.preproc_call,
+    ),
 
     // Variable Declarations
 
@@ -314,8 +487,8 @@ module.exports = grammar({
       seq($.implicit_statement, $._end_of_statement),
       seq($.save_statement, $._end_of_statement),
       seq($.import_statement, $._end_of_statement),
-      seq($.public_statement, $._end_of_statement),
-      seq($.private_statement, $._end_of_statement),
+      $.public_statement,
+      $.private_statement,
       $.enum,
       $.interface,
       $.derived_type_definition,
@@ -326,7 +499,12 @@ module.exports = grammar({
       seq($.parameter_statement, $._end_of_statement),
       seq($.equivalence_statement, $._end_of_statement),
       seq($.data_statement, $._end_of_statement),
-      prec(1, seq($.statement_label, $.format_statement, $._end_of_statement))
+      seq($.statement_function, $._end_of_statement),
+      prec(1, seq($.statement_label, $.format_statement, $._end_of_statement)),
+      $.preproc_include,
+      $.preproc_def,
+      $.preproc_function_def,
+      $.preproc_call,
     )),
 
     use_statement: $ => seq(
@@ -369,7 +547,6 @@ module.exports = grammar({
       choice(
         commaSep1(seq(
           $.intrinsic_type,
-          optional($.size),
           '(',
           commaSep1($.implicit_range),
           ')'
@@ -399,20 +576,22 @@ module.exports = grammar({
       ))
     )),
 
-    private_statement: $ => prec(1, seq(
+    private_statement: $ => prec.right(1, seq(
       caseInsensitive('private'),
       optional(seq(
-        '::',
+        optional('::'),
         commaSep1(choice($.identifier, $._generic_procedure))
-      ))
+      )),
+      $._end_of_statement,
     )),
 
-    public_statement: $ => prec(1, seq(
+    public_statement: $ => prec.right(1, seq(
       caseInsensitive('public'),
       optional(seq(
-        '::',
+        optional('::'),
         commaSep1(choice($.identifier, $._generic_procedure))
-      ))
+      )),
+      $._end_of_statement,
     )),
 
     namelist_statement: $ => seq(
@@ -424,7 +603,7 @@ module.exports = grammar({
       caseInsensitive('common'),
       repeat1(choice(
         $.variable_group,
-        commaSep1($.identifier)
+        commaSep1($._variable_declarator)
       ))
     ),
 
@@ -432,7 +611,7 @@ module.exports = grammar({
       '/',
       $._name,
       '/',
-      commaSep1($.identifier)
+      commaSep1($._variable_declarator)
     ),
 
     implicit_range: $ => seq(
@@ -457,17 +636,17 @@ module.exports = grammar({
 
     derived_type_definition: $ => seq(
       $.derived_type_statement,
-      optional($.public_statement),
-      optional($.private_statement),
-      optional(
+      repeat(choice(
+        $.public_statement,
+        $.private_statement,
         seq(
-          alias(caseInsensitive('sequence'), $.sequence_statement),
-          $._end_of_statement
-        )
-      ),
-      repeat(seq(
-        choice($.include_statement, $.variable_declaration),
-        $._end_of_statement
+            alias(caseInsensitive('sequence'), $.sequence_statement),
+            $._end_of_statement
+        ),
+        seq($.include_statement, $._end_of_statement),
+        seq($.variable_declaration, $._end_of_statement),
+        alias($.preproc_if_in_derived_type, $.preproc_if),
+        alias($.preproc_ifdef_in_derived_type, $.preproc_ifdef),
       )),
       optional($.derived_type_procedures),
       $.end_type_statement
@@ -501,6 +680,7 @@ module.exports = grammar({
         seq(optional('::'), $._type_name),
         seq(',', commaSep1($._derived_type_qualifier), '::', $._type_name)
       ),
+      optional(alias($.argument_list, $.derived_type_parameter_list)),
       $._end_of_statement
     ),
 
@@ -529,6 +709,7 @@ module.exports = grammar({
         $.method_name,
         seq($.binding_name, '=>', $.method_name),
       )),
+      $._end_of_statement,
     ),
 
     binding_name: $ => choice(
@@ -561,8 +742,12 @@ module.exports = grammar({
     )),
 
     variable_declaration: $ => seq(
-      choice($._intrinsic_type, $.derived_type, alias($.procedure_declaration, $.procedure)),
-      optional(seq(',', commaSep1($.type_qualifier))),
+      field('type', choice(
+        $.intrinsic_type,
+        $.derived_type,
+        alias($.procedure_declaration, $.procedure)
+      )),
+      optional(seq(',', commaSep1(field('attribute', $.type_qualifier)))),
       optional('::'),
       $._declaration_targets
     ),
@@ -577,11 +762,11 @@ module.exports = grammar({
 
     variable_modification: $ => seq(
       repeat1(choice(
-        $.type_qualifier,
+        alias($._standalone_type_qualifier, $.type_qualifier),
         $.variable_attributes
       )),
       optional('::'),
-      $._declaration_targets
+      commaSep1(field('declarator', $._variable_declarator)),
     ),
 
     variable_attributes: $ => seq(
@@ -597,44 +782,75 @@ module.exports = grammar({
       ')'
     ),
 
-    _declaration_targets: $ => commaSep1(choice(
+    _variable_declarator: $ => choice(
       $.identifier,
-      // Only valid for characters
-      prec.right(1, seq($.identifier, $.character_length)),
-      $.call_expression,
-      $.assignment_statement,
-      $.pointer_association_statement
+      $.sized_declarator,
+      $.coarray_declarator,
+    ),
+
+    sized_declarator: $ => prec.right(1, seq(
+        $.identifier,
+        choice(
+          alias($.argument_list, $.size),
+          $.character_length
+        )
     )),
 
-    _intrinsic_type: $ => prec.right(seq(
-      $.intrinsic_type,
-      optional($.size)
-    )),
+    _declaration_assignment: $ => seq(
+      field('left', $._variable_declarator),
+      '=',
+      field('right', $._expression)
+    ),
+    _declaration_pointer_association: $ => seq(
+      field('left', $._variable_declarator),
+      '=>',
+      field('right', $._expression)
+    ),
 
-    intrinsic_type: $ => choice(
-      caseInsensitive('byte'),
-      caseInsensitive('integer'),
-      caseInsensitive('real'),
-      whiteSpacedKeyword('double', 'precision'),
-      caseInsensitive('complex'),
-      whiteSpacedKeyword('double', 'complex'),
-      caseInsensitive('logical'),
-      caseInsensitive('character')
+    _declaration_targets: $ => commaSep1(field('declarator', choice(
+      $._variable_declarator,
+      alias($._declaration_assignment, $.init_declarator),
+      alias($._declaration_pointer_association, $.pointer_init_declarator),
+    ))),
+
+    _intrinsic_type: $ => choice(
+        caseInsensitive('byte'),
+        caseInsensitive('integer'),
+        caseInsensitive('real'),
+        whiteSpacedKeyword('double', 'precision'),
+        caseInsensitive('complex'),
+        whiteSpacedKeyword('double', 'complex'),
+        caseInsensitive('logical'),
+        caseInsensitive('character'),
+    ),
+
+    intrinsic_type: $ => seq(
+      $._intrinsic_type,
+      optional(field('kind', $.kind)),
     ),
 
     derived_type: $ => seq(
       choice(caseInsensitive('type'), caseInsensitive('class')),
       '(',
       // Strictly, only `class` can be unlimited polymorphic
-      choice(prec.dynamic(1, $._intrinsic_type), $._type_name, $.unlimited_polymorphic),
+      choice(
+        seq(
+          field('name', choice(
+            prec.dynamic(1, alias($._intrinsic_type, $.intrinsic_type)),
+            $._type_name,
+          )),
+          optional(field('kind', $.kind)),
+        ),
+        $.unlimited_polymorphic
+      ),
       ')'
     ),
 
     unlimited_polymorphic: $ => '*',
 
-    size: $ => choice(
-      seq(optional(alias('*', $.assumed_size)), $.argument_list),
-      seq('*', choice(/\d+/, $.parenthesized_expression))
+    kind: $ => choice(
+      seq(optional(alias('*', $.assumed_size)), $._argument_list),
+      seq('*', choice(alias(/\d+/, $.number_literal), $.parenthesized_expression))
     ),
 
     character_length: $ => seq(
@@ -643,10 +859,14 @@ module.exports = grammar({
       optional(seq('(', '*', ')'))
     ),
 
-    type_qualifier: $ => choice(
+    _standalone_type_qualifier: $ => choice(
       caseInsensitive('abstract'),
       caseInsensitive('allocatable'),
       caseInsensitive('automatic'),
+      prec.right(seq(
+        caseInsensitive('codimension'),
+        alias($.coarray_index, $.coarray_size),
+      )),
       prec.right(seq(
         caseInsensitive('dimension'),
         optional($.argument_list)
@@ -684,6 +904,16 @@ module.exports = grammar({
       caseInsensitive('volatile')
     ),
 
+    // These are split out to avoid clash with assignment statements
+    // as it turns out `len` is more likely to be used as a variable
+    // name than any of the other qualifiers
+    type_qualifier: $ => choice(
+      $._standalone_type_qualifier,
+      // Next two technically only valid on derived type components
+      field('type_param', caseInsensitive('kind')),
+      field('type_param', caseInsensitive('len')),
+    ),
+
     procedure_qualifier: $ => choice(
       caseInsensitive('elemental'),
       caseInsensitive('impure'),
@@ -716,10 +946,16 @@ module.exports = grammar({
 
     // Statements
 
-    _statement: $ => seq(
-      optional($.statement_label),
-      $._statements,
-      $._end_of_statement
+    _statement: $ => choice(
+      $.preproc_include,
+      $.preproc_def,
+      $.preproc_function_def,
+      $.preproc_call,
+      seq(
+        optional($.statement_label),
+        $._statements,
+        $._end_of_statement
+      )
     ),
 
     _statements: $ => choice(
@@ -738,6 +974,7 @@ module.exports = grammar({
       $.select_rank_statement,
       $.do_loop_statement,
       $.do_label_statement,
+      $.end_do_label_statement,
       $.format_statement,
       $.open_statement,
       $.close_statement,
@@ -749,6 +986,11 @@ module.exports = grammar({
       $.block_construct,
       $.associate_statement,
       $.file_position_statement,
+      $.allocate_statement,
+      $.entry_statement,
+      $.coarray_statement,
+      $.coarray_team_statement,
+      $.coarray_critical_statement,
     ),
 
     statement_label: $ => prec(1, alias($._integer_literal, 'statement_label')),
@@ -864,7 +1106,14 @@ module.exports = grammar({
       $.end_do_loop_statement
     ),
 
-    // Deleted feature
+    end_do_loop_statement: $ => seq(
+      whiteSpacedKeyword('end', 'do'),
+      optional($._block_label)
+    ),
+
+    // Deleted feature: non-block `do`. Actually, labelled-do is still
+    // valid (but obsolescent), but we need to capture them separately
+    // because otherwise it's too had to capture them at all
     do_label_statement: $ => seq(
       caseInsensitive('do'),
       $.statement_label_reference,
@@ -872,10 +1121,13 @@ module.exports = grammar({
       $.loop_control_expression
     ),
 
-    end_do_loop_statement: $ => seq(
+    // Because we've lumped together labelled-do and non-block-do in
+    // `do_label_statement`, we also need to be able to capture `end
+    // do` for a labelled-do
+    end_do_label_statement: $ => prec(-1, seq(
+      $.statement_label,
       whiteSpacedKeyword('end', 'do'),
-      optional($._block_label)
-    ),
+    )),
 
     while_statement: $ => seq(caseInsensitive('while'),
       $.parenthesized_expression),
@@ -890,7 +1142,7 @@ module.exports = grammar({
       '(',
       optional(seq(
         // This is actually limited to integer types only
-        field('type', $._intrinsic_type),
+        field('type', $.intrinsic_type),
         '::'
       )),
       commaSep1($.concurrent_control),
@@ -1117,7 +1369,7 @@ module.exports = grammar({
             whiteSpacedKeyword('class', 'is')
           ),
           choice(
-            seq('(', field('type', choice($._intrinsic_type, $.identifier)), ')'),
+            seq('(', field('type', choice($.intrinsic_type, $.identifier)), ')'),
           ),
         ),
         alias($._class_default, $.default)
@@ -1343,6 +1595,61 @@ module.exports = grammar({
 
     output_item_list: $ => prec.right(commaSep1($._expression)),
 
+    allocate_statement: $ => seq(
+      caseInsensitive('allocate'),
+      '(',
+      optional(field('type', seq(
+        choice(
+          $.intrinsic_type,
+          $.identifier,
+        ),
+        '::'
+      ))),
+      commaSep1(field('allocation', choice(
+        $.identifier,
+        $.derived_type_member_expression,
+        $.sized_allocation,
+        $.coarray_allocation,
+
+      ))),
+      optional(seq(',', commaSep1($.keyword_argument))),
+      ')',
+    ),
+
+    sized_allocation: $ => prec.right(1, seq(
+      $._expression,
+      alias($.argument_list, $.size),
+    )),
+
+    coarray_allocation: $ => seq(
+      choice(
+        $._expression,
+        $.sized_allocation,
+      ),
+      alias($.coarray_index, $.coarray_size),
+    ),
+
+    // Obsolescent feature
+    statement_function: $ => prec.right(seq(
+      $.identifier,
+      alias($._statement_function_arg_list, $.argument_list),
+      '=',
+      $._expression,
+    )),
+
+    _statement_function_arg_list: $ => seq('(', commaSep1($.identifier), ')'),
+
+    // Obsolescent feature
+    entry_statement: $ => seq(
+      caseInsensitive('entry'),
+      field('name', $._name),
+      optional(field('parameters',$._parameters)),
+      optional(repeat(choice(
+        $.language_binding,
+        $.function_result
+      ))),
+    ),
+
     // Expressions
 
     _expression: $ => choice(
@@ -1362,6 +1669,7 @@ module.exports = grammar({
       $.parenthesized_expression,
       $.call_expression,
       $.implied_do_loop_expression,
+      $.coarray_expression,
     ),
 
     parenthesized_expression: $ => seq(
@@ -1477,7 +1785,8 @@ module.exports = grammar({
       ')'
     ),
 
-    argument_list: $ => prec.dynamic(
+    // Unnamed node so we can reuse it for e.g. kind
+    _argument_list: $ => prec.dynamic(
       1,
       seq(
         '(',
@@ -1491,6 +1800,8 @@ module.exports = grammar({
         ')'
       )
     ),
+
+    argument_list: $ => $._argument_list,
 
     // precedence is used to prevent conflict with assignment expression
     keyword_argument: $ => prec(1, seq(
@@ -1533,7 +1844,7 @@ module.exports = grammar({
 
     _array_constructor_f2003: $ => seq('[', $._ac_value_list, ']'),
 
-    _type_spec: $ => seq(choice($._intrinsic_type, $.derived_type), '::'),
+    _type_spec: $ => seq(choice($.intrinsic_type, $.derived_type), '::'),
 
     _ac_value_list: $ => choice(
       field('type', $._type_spec),
@@ -1551,32 +1862,145 @@ module.exports = grammar({
       ')'
     ),
 
-    number_literal: $ => choice(
-      $._integer_literal,
-      $._float_literal,
-      $._boz_literal
+    number_literal: $ => seq(
+      choice(
+        $._integer_literal,
+        $._float_literal,
+        $._boz_literal
+      ),
+      optional($._kind)
     ),
 
-    boolean_literal: $ => token(seq(
+    boolean_literal: $ => seq(
       choice(
         caseInsensitive('\\.true\\.'),
         caseInsensitive('\\.false\\.')
       ),
-      optional(seq('_', /\w+/))
-    )),
+      optional($._kind)
+    ),
+
+    _kind: $ => seq(
+        token.immediate('_'),
+        field(
+          'kind',
+          choice(
+            alias(token.immediate(/[a-zA-Z]\w*/), $.identifier),
+            alias(token.immediate(/\d+/), $.number_literal)
+          )
+        )
+    ),
 
     null_literal: $ => prec(1, seq(
       caseInsensitive('null'), '(', ')'
     )),
 
-    // This handles files preprocessed by gfortran -E
-    // Other preprocessors may use different syntax
-    preproc_file_line: $ => seq(
-      '#',
-      alias(/\d+/, $.preproc_line_number),
-      alias(/"[^"\n]*"/, $.preproc_filename),
-      optional(/\d+/),
-      $._newline
+    string_literal: $ => seq(
+      // Having a kind _prefix_, with an underscore and no whitespace,
+      // is _really_ hard to parse without breaking other things, so
+      // we have to rely on an external scanner
+      optional(seq(
+        field('kind', alias($._string_literal_kind, $.identifier)),
+        // Although external scanner enforces trailing underscore, we
+        // also need to *capture* it here
+        token.immediate('_'),
+      )),
+      $._string_literal,
+    ),
+
+    // Coarrays
+
+    coarray_index: $ => seq(
+      '[',
+      commaSep1(choice(
+        $._expression,
+        alias($._coarray_extent_specifier, $.extent_specifier),
+        '*',
+      )),
+      commaSep(seq(',', $.keyword_argument)),
+      ']'
+    ),
+
+    // Copy of `extent_specifier` but we don't want `*` to be named `assumed_size`
+    _coarray_extent_specifier: $ => seq(
+      optional($._expression), // start
+      ':',
+      optional(choice($._expression, '*')), // stop
+      optional(seq(':', $._expression)) // stride
+    ),
+
+    coarray_declarator: $ => prec.right(seq(
+      choice(
+        $.identifier,
+        $.sized_declarator,
+      ),
+      alias($.coarray_index, $.coarray_size),
+    )),
+
+    coarray_expression: $ => prec.right(seq(
+      $._expression,
+      $.coarray_index,
+    )),
+
+    coarray_statement: $ => choice(
+      seq(
+        choice(
+          caseInsensitive('sync'),
+          caseInsensitive('form'),
+        ),
+        choice(
+          caseInsensitive('all'),
+          caseInsensitive('images'),
+          caseInsensitive('memory'),
+          caseInsensitive('team'),
+        ),
+        optional($.argument_list),
+      ),
+      seq(caseInsensitive('fail'), caseInsensitive('image')),
+      seq(
+        caseInsensitive('event'),
+        choice(
+          caseInsensitive('post'),
+          caseInsensitive('wait'),
+        ),
+        $.argument_list,
+      ),
+      prec.right(1, seq(
+        choice(
+          caseInsensitive('lock'),
+          caseInsensitive('unlock'),
+        ),
+        $.argument_list,
+      )),
+    ),
+
+    coarray_team_statement: $ => seq(
+      optional($.block_label_start_expression),
+      caseInsensitive('change'),
+      caseInsensitive('team'),
+      $.argument_list,
+      $._end_of_statement,
+      repeat($._statement),
+      $.end_coarray_team_statement,
+    ),
+
+    end_coarray_team_statement: $ => seq(
+      whiteSpacedKeyword('end', 'team'),
+      optional($.argument_list),
+      optional($._block_label),
+    ),
+
+    coarray_critical_statement: $ => seq(
+      optional($.block_label_start_expression),
+      caseInsensitive('critical'),
+      optional($.argument_list),
+      $._end_of_statement,
+      repeat($._statement),
+      $.end_coarray_critical_statement,
+    ),
+
+    end_coarray_critical_statement: $ => seq(
+      whiteSpacedKeyword('end', 'critical'),
+      optional($._block_label),
     ),
 
     // Fortran doesn't have reserved keywords, and to allow _just
@@ -1585,25 +2009,54 @@ module.exports = grammar({
     // add the keywords here -- and possibly in `conflicts` too.
     identifier: $ => choice(
       /[a-zA-Z_]\w*/,
+      caseInsensitive('allocatable'),
+      caseInsensitive('automatic'),
       caseInsensitive('block'),
       caseInsensitive('byte'),
+      caseInsensitive('change'),
+      caseInsensitive('constant'),
+      caseInsensitive('contiguous'),
+      caseInsensitive('critical'),
       caseInsensitive('cycle'),
       caseInsensitive('data'),
+      caseInsensitive('device'),
+      prec(-1, caseInsensitive('dimension')),
       caseInsensitive('double'),
       caseInsensitive('elseif'),
       caseInsensitive('end'),
       caseInsensitive('endif'),
+      caseInsensitive('entry'),
       caseInsensitive('error'),
+      caseInsensitive('event'),
       caseInsensitive('exit'),
+      caseInsensitive('external'),
+      caseInsensitive('fail'),
+      caseInsensitive('form'),
       caseInsensitive('format'),
       caseInsensitive('if'),
       caseInsensitive('inquire'),
+      caseInsensitive('intrinsic'),
+      caseInsensitive('kind'),
+      caseInsensitive('len'),
+      caseInsensitive('lock'),
       caseInsensitive('null'),
+      caseInsensitive('optional'),
+      caseInsensitive('parameter'),
+      caseInsensitive('pointer'),
+      caseInsensitive('private'),
+      caseInsensitive('public'),
       caseInsensitive('read'),
       caseInsensitive('real'),
+      caseInsensitive('save'),
       caseInsensitive('select'),
+      caseInsensitive('sequence'),
+      caseInsensitive('shared'),
+      caseInsensitive('static'),
       caseInsensitive('stop'),
+      caseInsensitive('sync'),
       caseInsensitive('target'),
+      caseInsensitive('texture'),
+      caseInsensitive('unlock'),
       caseInsensitive('value'),
       caseInsensitive('write'),
     ),
@@ -1636,12 +2089,6 @@ function whiteSpacedKeyword (prefix, suffix, aliasAsWord = true) {
   return result
 }
 
-/* TODO
-function preprocessor (command) {
-  return alias(new RegExp('#[ \t]*' + command), '#' + command)
-}
-*/
-
 function commaSep (rule) {
   return optional(commaSep1(rule))
 }
@@ -1667,4 +2114,120 @@ function blockStructureEnding ($, structType) {
     $._end_of_statement
   ))
   return obj
+}
+
+/**
+ *
+ * @param {string} suffix
+ *
+ * @param {RuleBuilder<string>} content
+ *
+ * @param {number} precedence
+ *
+ * @return {RuleBuilders<string, string>}
+ */
+function preprocIf(suffix, content, precedence = 0) {
+  /**
+    *
+    * @param {GrammarSymbols<string>} $
+    *
+    * @return {ChoiceRule}
+    *
+    */
+  function alternativeBlock($) {
+    return choice(
+      suffix ? alias($['preproc_else' + suffix], $.preproc_else) : $.preproc_else,
+      suffix ? alias($['preproc_elif' + suffix], $.preproc_elif) : $.preproc_elif,
+      suffix ? alias($['preproc_elifdef' + suffix], $.preproc_elifdef) : $.preproc_elifdef,
+    );
+  }
+
+  return {
+    ['preproc_if' + suffix]: $ => prec(precedence, seq(
+      preprocessor('if'),
+      field('condition', $._preproc_expression),
+      optional($.preproc_comment),
+      '\n',
+      content($),
+      field('alternative', optional(alternativeBlock($))),
+      preprocessor('endif'),
+      optional($.preproc_comment),
+    )),
+
+    ['preproc_ifdef' + suffix]: $ => prec(precedence, seq(
+      choice(preprocessor('ifdef'), preprocessor('ifndef')),
+      field('name', $.identifier),
+      optional($.preproc_comment),
+      content($),
+      field('alternative', optional(alternativeBlock($))),
+      preprocessor('endif'),
+      optional($.preproc_comment),
+    )),
+
+    ['preproc_else' + suffix]: $ => prec(precedence, seq(
+      preprocessor('else'),
+      optional($.preproc_comment),
+      content($),
+    )),
+
+    ['preproc_elif' + suffix]: $ => prec(precedence, seq(
+      preprocessor('elif'),
+      optional($.preproc_comment),
+      field('condition', $._preproc_expression),
+      '\n',
+      content($),
+      field('alternative', optional(alternativeBlock($))),
+    )),
+
+    ['preproc_elifdef' + suffix]: $ => prec(precedence, seq(
+      choice(preprocessor('elifdef'), preprocessor('elifndef')),
+      field('name', $.identifier),
+      optional($.preproc_comment),
+      content($),
+      field('alternative', optional(alternativeBlock($))),
+    )),
+  };
+}
+
+/**
+  * Creates a preprocessor regex rule
+  *
+  * @param {RegExp|Rule|String} command
+  *
+  * @return {AliasRule}
+  */
+function preprocessor(command) {
+  return alias(new RegExp('#[ \t]*' + command), '#' + command);
+}
+
+/**
+ * Common rule for procedures (function, subroutine, module procedure)
+ *
+ * @param {GrammarSymbols<string>} $
+ * @param {Rule} start_statement
+ * @param {Rule} end_statement
+ *
+ * @return {Rule}
+ */
+function procedure($, start_statement, end_statement) {
+  return seq(
+    start_statement,
+    $._end_of_statement,
+    repeat(
+      choice(
+        $._specification_part,
+        alias($.preproc_if_in_specification_part, $.preproc_if),
+        alias($.preproc_ifdef_in_specification_part, $.preproc_ifdef)
+      ),
+    ),
+    repeat(
+      choice(
+        $._statement,
+        alias($.preproc_if_in_statements, $.preproc_if),
+        alias($.preproc_ifdef_in_statements, $.preproc_ifdef)
+      ),
+    ),
+    optional($.internal_procedures),
+    end_statement
+  );
 }

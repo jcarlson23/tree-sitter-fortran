@@ -9,7 +9,9 @@ enum TokenType {
     FLOAT_LITERAL,
     BOZ_LITERAL,
     STRING_LITERAL,
-    END_OF_STATEMENT
+    STRING_LITERAL_KIND,
+    END_OF_STATEMENT,
+    PREPROC_UNARY_OPERATOR,
 };
 
 typedef struct {
@@ -22,7 +24,8 @@ static inline void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
 // ignore current character and advance
 static inline void skip(TSLexer *lexer) { lexer->advance(lexer, true); }
 
-static bool is_ident_char(char chr) { return iswalnum(chr) || chr == '_'; }
+// is `chr` ok for an identifier?
+static bool is_identifier_char(char chr) { return iswalnum(chr) || chr == '_'; }
 
 static bool is_boz_sentinel(char chr) {
     switch (chr) {
@@ -109,17 +112,6 @@ static bool scan_number(TSLexer *lexer) {
             lexer->mark_end(lexer);
             lexer->result_symbol = FLOAT_LITERAL;
         }
-        // get size qualifer
-        if (lexer->lookahead == '_') {
-            advance(lexer);
-            if (!isalnum(lexer->lookahead)) {
-                return true; // valid number token with junk after it
-            }
-            while (is_ident_char(lexer->lookahead)) {
-                advance(lexer); // store all digits
-            }
-            lexer->mark_end(lexer);
-        }
     }
     return digits;
 }
@@ -135,10 +127,10 @@ static bool scan_boz(TSLexer *lexer) {
     if (lexer->lookahead == '\'' || lexer->lookahead == '"') {
         quote = lexer->lookahead;
         advance(lexer);
-        if (!isxdigit(lexer->lookahead)) {
+        if (!iswxdigit(lexer->lookahead)) {
             return false;
         }
-        while (isxdigit(lexer->lookahead)) {
+        while (iswxdigit(lexer->lookahead)) {
             advance(lexer); // store all hex digits
         }
         if (lexer->lookahead != quote) {
@@ -230,6 +222,34 @@ static bool scan_end_line_continuation(Scanner *scanner, TSLexer *lexer) {
     return true;
 }
 
+static bool scan_string_literal_kind(TSLexer *lexer) {
+  // Strictly, it's allowed for the kind to be an integer literal, in
+  // practice I've not seen it
+  if (!iswalpha(lexer->lookahead)) {
+    return false;
+  }
+
+  lexer->result_symbol = STRING_LITERAL_KIND;
+
+  // We need two characters of lookahead to see `_"`
+  char current_char = '\0';
+
+  while (is_identifier_char(lexer->lookahead) && !lexer->eof(lexer)) {
+      current_char = lexer->lookahead;
+      // Don't capture the trailing underscore as part of the kind identifier
+      if (lexer->lookahead == '_') {
+          lexer->mark_end(lexer);
+      }
+      advance(lexer);
+  }
+
+  if ((current_char != '_') || (lexer->lookahead != '"' && lexer->lookahead != '\'')) {
+    return false;
+  }
+
+  return true;
+}
+
 static bool scan_string_literal(TSLexer *lexer) {
     const char opening_quote = lexer->lookahead;
 
@@ -290,6 +310,17 @@ static bool scan_string_literal(TSLexer *lexer) {
     return false;
 }
 
+/// Need an external scanner to catch '!' before its parsed as a comment
+static bool scan_preproc_unary_operator(TSLexer *lexer) {
+  const char next_char = lexer->lookahead;
+  if (next_char == '!' || next_char == '~' || next_char == '-' || next_char == '+') {
+    advance(lexer);
+    lexer->result_symbol = PREPROC_UNARY_OPERATOR;
+    return true;
+  }
+  return false;
+}
+
 static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
     // Consume any leading whitespace except newlines
     while (iswblank(lexer->lookahead)) {
@@ -331,8 +362,22 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
         }
     }
 
+    if (valid_symbols[PREPROC_UNARY_OPERATOR]) {
+      if (scan_preproc_unary_operator(lexer)) {
+        return true;
+      }
+    }
+
     if (scan_start_line_continuation(scanner, lexer)) {
         return true;
+    }
+
+    if (valid_symbols[STRING_LITERAL_KIND]) {
+      // This may need a lot of lookahead, so should (probably) always
+      // be the last token to look for
+      if (scan_string_literal_kind(lexer)) {
+        return true;
+      }
     }
 
     return false;
